@@ -1,6 +1,6 @@
 # SYSTOLIC_ARRAY_DESIGN
 
-This repository contains the **SystemVerilog RTL design of a 4×4 Systolic Array** for matrix multiplication.
+This repository contains the **Verilog RTL design of a 4×4 Systolic Array** for matrix multiplication.
 
 The design consists of four main modules:
 
