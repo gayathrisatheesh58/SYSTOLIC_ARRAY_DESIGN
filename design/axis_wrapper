@@ -1,0 +1,368 @@
+`timescale 1ns / 1ps
+
+//=====================================================================
+// AXI4-STREAM WRAPPER FOR 4x4 SYSTOLIC ARRAY
+//
+// AXI DATA WIDTH = 32 bits
+//
+// INPUT PACKET
+//
+//   Word 0 : W[0][0] W[0][1] W[0][2] W[0][3]
+//   Word 1 : W[1][0] W[1][1] W[1][2] W[1][3]
+//   Word 2 : W[2][0] W[2][1] W[2][2] W[2][3]
+//   Word 3 : W[3][0] W[3][1] W[3][2] W[3][3]
+//
+//   Word 4 : activation vector
+//   Word 5 : activation vector
+//   Word 6 : activation vector
+//   Word 7 : activation vector
+//
+// OUTPUT PACKET
+//
+//   Word 0 : Column 0 result
+//   Word 1 : Column 1 result
+//   Word 2 : Column 2 result
+//   Word 3 : Column 3 result
+//
+//=====================================================================
+
+module axis_systolic_array #(
+    parameter DATA_WIDTH = 8,
+    parameter AXIS_WIDTH = 32
+)(
+    //=================================================================
+    // CLOCK / RESET
+    //=================================================================
+
+    input wire aclk,
+    input wire aresetn,
+
+    //=================================================================
+    // AXI4-STREAM INPUT
+    //=================================================================
+
+    input  wire [AXIS_WIDTH-1:0] s_axis_tdata,
+    input  wire                  s_axis_tvalid,
+    output wire                  s_axis_tready,
+    input  wire                  s_axis_tlast,
+
+    //=================================================================
+    // AXI4-STREAM OUTPUT
+    //=================================================================
+
+    output wire [AXIS_WIDTH-1:0] m_axis_tdata,
+    output wire                  m_axis_tvalid,
+    input  wire                  m_axis_tready,
+    output wire                  m_axis_tlast
+);
+
+    //=================================================================
+    // PARAMETERS
+    //=================================================================
+
+    localparam NUM_ROWS  = 4;
+    localparam NUM_COLS  = 4;
+    localparam ACC_WIDTH = (2 * DATA_WIDTH) + 1;
+
+    //=================================================================
+    // RESET
+    //=================================================================
+
+    wire rst;
+
+    assign rst = ~aresetn;
+
+    //=================================================================
+    // SYSTOLIC ARRAY INPUTS
+    //=================================================================
+
+    reg load_weight;
+
+    reg signed [NUM_ROWS*NUM_COLS*DATA_WIDTH-1:0] weight_in;
+
+    reg signed [NUM_ROWS*DATA_WIDTH-1:0] a_in;
+
+    //=================================================================
+    // SYSTOLIC ARRAY OUTPUTS
+    //=================================================================
+
+    wire signed [NUM_COLS*ACC_WIDTH-1:0] acc_out;
+
+    wire signed [NUM_ROWS*DATA_WIDTH-1:0] a_out;
+
+    //=================================================================
+    // INPUT WORD COUNTER
+    //
+    // 0 - 3 : weight words
+    // 4 - 7 : activation words
+    //=================================================================
+
+    reg [3:0] input_count;
+
+    //=================================================================
+    // OUTPUT CONTROL
+    //=================================================================
+
+    reg [1:0] output_count;
+
+    reg output_valid;
+
+    //=================================================================
+    // OUTPUT DATA REGISTER
+    //=================================================================
+
+    reg [AXIS_WIDTH-1:0] output_data;
+
+    //=================================================================
+    // AXI INPUT READY
+    //
+    // Do not accept new input while output packet is being sent.
+    //=================================================================
+
+    assign s_axis_tready = ~output_valid;
+
+    //=================================================================
+    // AXI OUTPUT
+    //=================================================================
+
+    assign m_axis_tdata  = output_data;
+
+    assign m_axis_tvalid = output_valid;
+
+    assign m_axis_tlast =
+        output_valid && (output_count == 2'd3);
+
+    //=================================================================
+    // SYSTOLIC ARRAY INSTANCE
+    //=================================================================
+
+    systolic_array_4x4 #(
+        .NUM_ROWS(NUM_ROWS),
+        .NUM_COLS(NUM_COLS),
+        .DATA_WIDTH(DATA_WIDTH)
+    ) systolic_array_inst (
+
+        .clk(clk),
+
+        .rst(rst),
+
+        .load_weight(load_weight),
+
+        .weight_in(weight_in),
+
+        .a_in(a_in),
+
+        .acc_out(acc_out),
+
+        .a_out(a_out)
+
+    );
+
+    //=================================================================
+    // INPUT / OUTPUT CONTROLLER
+    //=================================================================
+
+    always @(posedge aclk) begin
+
+        //=============================================================
+        // RESET
+        //=============================================================
+
+        if (rst) begin
+
+            load_weight  <= 1'b0;
+
+            weight_in    <= '0;
+
+            a_in         <= '0;
+
+            input_count  <= 4'd0;
+
+            output_count <= 2'd0;
+
+            output_valid <= 1'b0;
+
+        end
+
+        else begin
+
+            //=========================================================
+            // DEFAULT
+            //
+            // load_weight is a pulse.
+            //=========================================================
+
+            load_weight <= 1'b0;
+
+            //=========================================================
+            // OUTPUT PHASE
+            //=========================================================
+
+            if (output_valid) begin
+
+                if (m_axis_tready) begin
+
+                    //-------------------------------------------------
+                    // Last result transferred
+                    //-------------------------------------------------
+
+                    if (output_count == 2'd3) begin
+
+                        output_valid <= 1'b0;
+
+                        output_count <= 2'd0;
+
+                        input_count  <= 4'd0;
+
+                    end
+
+                    //-------------------------------------------------
+                    // Move to next result
+                    //-------------------------------------------------
+
+                    else begin
+
+                        output_count <= output_count + 1'b1;
+
+                    end
+
+                end
+
+            end
+
+            //=========================================================
+            // INPUT PHASE
+            //=========================================================
+
+            else begin
+
+                if (s_axis_tvalid && s_axis_tready) begin
+
+                    //=================================================
+                    // WORDS 0-3
+                    //
+                    // Collect 128-bit weight matrix.
+                    //
+                    // Each AXI word contains one row of 4 weights.
+                    //=================================================
+
+                    if (input_count < 4) begin
+
+                        weight_in[
+                            input_count*AXIS_WIDTH +:
+                            AXIS_WIDTH
+                        ] <= s_axis_tdata;
+
+                        //-------------------------------------------------
+                        // After receiving all four weight words,
+                        // load the complete weight matrix into the PEs.
+                        //-------------------------------------------------
+
+                        if (input_count == 3) begin
+
+                            load_weight <= 1'b1;
+
+                        end
+
+                    end
+
+                    //=================================================
+                    // WORDS 4-7
+                    //
+                    // Activation input.
+                    //=================================================
+
+                    else begin
+
+                        a_in <= s_axis_tdata;
+
+                        //-------------------------------------------------
+                        // After the fourth activation word, wait for
+                        // the systolic array to finish.
+                        //-------------------------------------------------
+
+                        if (input_count == 7) begin
+
+                            output_valid <= 1'b1;
+
+                            output_count <= 2'd0;
+
+                        end
+
+                    end
+
+                    //=================================================
+                    // NEXT INPUT WORD
+                    //=================================================
+
+                    input_count <= input_count + 1'b1;
+
+                end
+
+            end
+
+        end
+
+    end
+
+    //=================================================================
+    // OUTPUT DATA MUX
+    //
+    // acc_out contains four 17-bit results:
+    //
+    //   acc_out[16:0]   -> Column 0
+    //   acc_out[33:17]  -> Column 1
+    //   acc_out[50:34]  -> Column 2
+    //   acc_out[67:51]  -> Column 3
+    //
+    // Each result is placed in the lower 17 bits of a 32-bit AXI word.
+    //=================================================================
+
+    always @(*) begin
+
+        output_data = {AXIS_WIDTH{1'b0}};
+
+        case (output_count)
+
+            2'd0: begin
+
+                output_data[ACC_WIDTH-1:0] =
+                    acc_out[ACC_WIDTH-1:0];
+
+            end
+
+            2'd1: begin
+
+                output_data[ACC_WIDTH-1:0] =
+                    acc_out[(2*ACC_WIDTH)-1:
+                            ACC_WIDTH];
+
+            end
+
+            2'd2: begin
+
+                output_data[ACC_WIDTH-1:0] =
+                    acc_out[(3*ACC_WIDTH)-1:
+                            (2*ACC_WIDTH)];
+
+            end
+
+            2'd3: begin
+
+                output_data[ACC_WIDTH-1:0] =
+                    acc_out[(4*ACC_WIDTH)-1:
+                            (3*ACC_WIDTH)];
+
+            end
+
+            default: begin
+
+                output_data = {AXIS_WIDTH{1'b0}};
+
+            end
+
+        endcase
+
+    end
+
+endmodule
