@@ -12,10 +12,10 @@
 //   Word 2 : W[2][0] W[2][1] W[2][2] W[2][3]
 //   Word 3 : W[3][0] W[3][1] W[3][2] W[3][3]
 //
-//   Word 4 : activation vector
-//   Word 5 : activation vector
-//   Word 6 : activation vector
-//   Word 7 : activation vector
+//   Word 4 : Activation row 0
+//   Word 5 : Activation row 1
+//   Word 6 : Activation row 2
+//   Word 7 : Activation row 3
 //
 // OUTPUT PACKET
 //
@@ -34,8 +34,8 @@ module axis_systolic_array #(
     // CLOCK / RESET
     //=================================================================
 
-    input wire aclk,
-    input wire aresetn,
+    input  wire aclk,
+    input  wire aresetn,
 
     //=================================================================
     // AXI4-STREAM INPUT
@@ -65,6 +65,17 @@ module axis_systolic_array #(
     localparam ACC_WIDTH = (2 * DATA_WIDTH) + 1;
 
     //=================================================================
+    // CONTROLLER STATES
+    //=================================================================
+
+    localparam S_RECEIVE = 2'd0;
+    localparam S_START   = 2'd1;
+    localparam S_WAIT    = 2'd2;
+    localparam S_OUTPUT  = 2'd3;
+
+    reg [1:0] state;
+
+    //=================================================================
     // RESET
     //=================================================================
 
@@ -73,22 +84,41 @@ module axis_systolic_array #(
     assign rst = ~aresetn;
 
     //=================================================================
-    // SYSTOLIC ARRAY INPUTS
+    // INPUT MATRICES
+    //
+    // 128 bits for a 4x4 matrix with 8-bit elements.
+    //
+    // weight_flat:
+    //   [  7:  0] = W[0][0]
+    //   [ 15:  8] = W[0][1]
+    //   ...
+    //   [127:120] = W[3][3]
+    //
+    // matrix_a_flat:
+    //   [  7:  0] = A[0][0]
+    //   [ 15:  8] = A[0][1]
+    //   ...
+    //   [127:120] = A[3][3]
     //=================================================================
 
-    reg load_weight;
+    reg signed
+        [NUM_ROWS*NUM_COLS*DATA_WIDTH-1:0] weight_flat;
 
-    reg signed [NUM_ROWS*NUM_COLS*DATA_WIDTH-1:0] weight_in;
-
-    reg signed [NUM_ROWS*DATA_WIDTH-1:0] a_in;
+    reg signed
+        [NUM_ROWS*NUM_COLS*DATA_WIDTH-1:0] matrix_a_flat;
 
     //=================================================================
-    // SYSTOLIC ARRAY OUTPUTS
+    // DUT CONTROL / OUTPUT SIGNALS
     //=================================================================
 
-    wire signed [NUM_COLS*ACC_WIDTH-1:0] acc_out;
+    reg  start;
 
-    wire signed [NUM_ROWS*DATA_WIDTH-1:0] a_out;
+    wire dut_out_valid;
+    wire dut_busy;
+    wire dut_done;
+
+    wire signed
+        [NUM_COLS*ACC_WIDTH-1:0] acc_out;
 
     //=================================================================
     // INPUT WORD COUNTER
@@ -101,25 +131,23 @@ module axis_systolic_array #(
 
     //=================================================================
     // OUTPUT CONTROL
+    //
+    // 0 - 3 : four output words
     //=================================================================
 
     reg [1:0] output_count;
 
     reg output_valid;
 
-    //=================================================================
-    // OUTPUT DATA REGISTER
-    //=================================================================
-
     reg [AXIS_WIDTH-1:0] output_data;
 
     //=================================================================
     // AXI INPUT READY
     //
-    // Do not accept new input while output packet is being sent.
+    // Accept input only during the RECEIVE state.
     //=================================================================
 
-    assign s_axis_tready = ~output_valid;
+    assign s_axis_tready = (state == S_RECEIVE);
 
     //=================================================================
     // AXI OUTPUT
@@ -129,37 +157,44 @@ module axis_systolic_array #(
 
     assign m_axis_tvalid = output_valid;
 
+    // TLAST is asserted on the fourth output word.
     assign m_axis_tlast =
         output_valid && (output_count == 2'd3);
 
     //=================================================================
-    // SYSTOLIC ARRAY INSTANCE
+    // SYSTOLIC ARRAY TOP-LEVEL DUT
+    //
+    // AXIS wrapper connects to the existing DUT top.
+    //
+    // The DUT internally contains:
+    //
+    //   systolic_array_4x4_top
+    //          |
+    //          +-- matrix_feeder
+    //          |
+    //          +-- systolic_array_4x4
     //=================================================================
 
-    systolic_array_4x4 #(
-        .NUM_ROWS(NUM_ROWS),
-        .NUM_COLS(NUM_COLS),
-        .DATA_WIDTH(DATA_WIDTH)
-    ) systolic_array_inst (
+    systolic_array_4x4_top #(
+        .NUM_ROWS   (NUM_ROWS),
+        .NUM_COLS   (NUM_COLS),
+        .DATA_WIDTH (DATA_WIDTH)
+    ) dut (
+        .clk           (aclk),
+        .rst           (rst),
+        .start         (start),
 
-        .clk(clk),
+        .matrix_a_flat (matrix_a_flat),
+        .weight_flat   (weight_flat),
 
-        .rst(rst),
-
-        .load_weight(load_weight),
-
-        .weight_in(weight_in),
-
-        .a_in(a_in),
-
-        .acc_out(acc_out),
-
-        .a_out(a_out)
-
+        .acc_out       (acc_out),
+        .out_valid     (dut_out_valid),
+        .busy          (dut_busy),
+        .done          (dut_done)
     );
 
     //=================================================================
-    // INPUT / OUTPUT CONTROLLER
+    // AXI / DUT CONTROLLER
     //=================================================================
 
     always @(posedge aclk) begin
@@ -170,17 +205,19 @@ module axis_systolic_array #(
 
         if (rst) begin
 
-            load_weight  <= 1'b0;
+            state        <= S_RECEIVE;
 
-            weight_in    <= '0;
-
-            a_in         <= '0;
+            start        <= 1'b0;
 
             input_count  <= 4'd0;
 
             output_count <= 2'd0;
 
             output_valid <= 1'b0;
+
+            weight_flat  <= '0;
+
+            matrix_a_flat <= '0;
 
         end
 
@@ -189,117 +226,186 @@ module axis_systolic_array #(
             //=========================================================
             // DEFAULT
             //
-            // load_weight is a pulse.
+            // start is normally LOW.
+            //
+            // It becomes HIGH only in S_START for one clock.
             //=========================================================
 
-            load_weight <= 1'b0;
+            start <= 1'b0;
 
-            //=========================================================
-            // OUTPUT PHASE
-            //=========================================================
+            case (state)
 
-            if (output_valid) begin
+                //=====================================================
+                // STATE 1 : RECEIVE INPUT PACKET
+                //=====================================================
 
-                if (m_axis_tready) begin
+                S_RECEIVE: begin
 
-                    //-------------------------------------------------
-                    // Last result transferred
-                    //-------------------------------------------------
+                    if (s_axis_tvalid && s_axis_tready) begin
 
-                    if (output_count == 2'd3) begin
+                        //-------------------------------------------------
+                        // WORDS 0-3
+                        //
+                        // Store weight matrix.
+                        //-------------------------------------------------
 
-                        output_valid <= 1'b0;
+                        if (input_count < 4) begin
+
+                            weight_flat[
+                                input_count*AXIS_WIDTH +:
+                                AXIS_WIDTH
+                            ] <= s_axis_tdata;
+
+                        end
+
+                        //-------------------------------------------------
+                        // WORDS 4-7
+                        //
+                        // Store activation matrix.
+                        //-------------------------------------------------
+
+                        else begin
+
+                            matrix_a_flat[
+                                (input_count - 4)*AXIS_WIDTH +:
+                                AXIS_WIDTH
+                            ] <= s_axis_tdata;
+
+                        end
+
+                        //-------------------------------------------------
+                        // LAST INPUT WORD
+                        //
+                        // After Word 7, all input data has been
+                        // collected.
+                        //-------------------------------------------------
+
+                        if (input_count == 4'd7) begin
+
+                            input_count <= 4'd0;
+
+                            state <= S_START;
+
+                        end
+
+                        //-------------------------------------------------
+                        // MORE INPUT WORDS REQUIRED
+                        //-------------------------------------------------
+
+                        else begin
+
+                            input_count <= input_count + 1'b1;
+
+                        end
+
+                    end
+
+                end
+
+
+                //=====================================================
+                // STATE 2 : START DUT
+                //=====================================================
+
+                S_START: begin
+
+                    // Generate one-clock start pulse.
+                    start <= 1'b1;
+
+                    // Move immediately to WAIT state.
+                    state <= S_WAIT;
+
+                end
+
+
+                //=====================================================
+                // STATE 3 : WAIT FOR DUT
+                //=====================================================
+
+                S_WAIT: begin
+
+                    // Do not accept new AXI input here.
+                    //
+                    // Wait until matrix_feeder reports that the
+                    // systolic computation is complete.
+
+                    if (dut_out_valid) begin
 
                         output_count <= 2'd0;
 
-                        input_count  <= 4'd0;
+                        output_valid <= 1'b1;
 
-                    end
-
-                    //-------------------------------------------------
-                    // Move to next result
-                    //-------------------------------------------------
-
-                    else begin
-
-                        output_count <= output_count + 1'b1;
+                        state <= S_OUTPUT;
 
                     end
 
                 end
 
-            end
 
-            //=========================================================
-            // INPUT PHASE
-            //=========================================================
+                //=====================================================
+                // STATE 4 : SEND OUTPUT PACKET
+                //=====================================================
 
-            else begin
+                S_OUTPUT: begin
 
-                if (s_axis_tvalid && s_axis_tready) begin
-
-                    //=================================================
-                    // WORDS 0-3
+                    // AXI transfer occurs only when:
                     //
-                    // Collect 128-bit weight matrix.
-                    //
-                    // Each AXI word contains one row of 4 weights.
-                    //=================================================
+                    // VALID = 1
+                    // READY = 1
 
-                    if (input_count < 4) begin
-
-                        weight_in[
-                            input_count*AXIS_WIDTH +:
-                            AXIS_WIDTH
-                        ] <= s_axis_tdata;
+                    if (output_valid && m_axis_tready) begin
 
                         //-------------------------------------------------
-                        // After receiving all four weight words,
-                        // load the complete weight matrix into the PEs.
+                        // FOURTH / LAST OUTPUT WORD
                         //-------------------------------------------------
 
-                        if (input_count == 3) begin
+                        if (output_count == 2'd3) begin
 
-                            load_weight <= 1'b1;
-
-                        end
-
-                    end
-
-                    //=================================================
-                    // WORDS 4-7
-                    //
-                    // Activation input.
-                    //=================================================
-
-                    else begin
-
-                        a_in <= s_axis_tdata;
-
-                        //-------------------------------------------------
-                        // After the fourth activation word, wait for
-                        // the systolic array to finish.
-                        //-------------------------------------------------
-
-                        if (input_count == 7) begin
-
-                            output_valid <= 1'b1;
+                            output_valid <= 1'b0;
 
                             output_count <= 2'd0;
 
+                            input_count <= 4'd0;
+
+                            // Ready to receive another packet.
+                            state <= S_RECEIVE;
+
+                        end
+
+                        //-------------------------------------------------
+                        // MOVE TO NEXT OUTPUT WORD
+                        //-------------------------------------------------
+
+                        else begin
+
+                            output_count <= output_count + 1'b1;
+
                         end
 
                     end
 
-                    //=================================================
-                    // NEXT INPUT WORD
-                    //=================================================
+                end
 
-                    input_count <= input_count + 1'b1;
+
+                //=====================================================
+                // SAFETY DEFAULT
+                //=====================================================
+
+                default: begin
+
+                    state        <= S_RECEIVE;
+
+                    start        <= 1'b0;
+
+                    input_count  <= 4'd0;
+
+                    output_count <= 2'd0;
+
+                    output_valid <= 1'b0;
 
                 end
 
-            end
+            endcase
 
         end
 
@@ -308,21 +414,29 @@ module axis_systolic_array #(
     //=================================================================
     // OUTPUT DATA MUX
     //
-    // acc_out contains four 17-bit results:
+    // ACC_WIDTH = 17 bits for DATA_WIDTH = 8.
     //
-    //   acc_out[16:0]   -> Column 0
-    //   acc_out[33:17]  -> Column 1
-    //   acc_out[50:34]  -> Column 2
-    //   acc_out[67:51]  -> Column 3
+    // acc_out:
     //
-    // Each result is placed in the lower 17 bits of a 32-bit AXI word.
+    //   acc_out[16:0]    -> Column 0
+    //   acc_out[33:17]   -> Column 1
+    //   acc_out[50:34]   -> Column 2
+    //   acc_out[67:51]   -> Column 3
+    //
+    // Each result is placed in the lower 17 bits of the
+    // 32-bit AXI output word.
     //=================================================================
 
     always @(*) begin
 
+        // Default output word.
         output_data = {AXIS_WIDTH{1'b0}};
 
         case (output_count)
+
+            //=========================================================
+            // OUTPUT WORD 0
+            //=========================================================
 
             2'd0: begin
 
@@ -330,6 +444,10 @@ module axis_systolic_array #(
                     acc_out[ACC_WIDTH-1:0];
 
             end
+
+            //=========================================================
+            // OUTPUT WORD 1
+            //=========================================================
 
             2'd1: begin
 
@@ -339,6 +457,10 @@ module axis_systolic_array #(
 
             end
 
+            //=========================================================
+            // OUTPUT WORD 2
+            //=========================================================
+
             2'd2: begin
 
                 output_data[ACC_WIDTH-1:0] =
@@ -347,6 +469,10 @@ module axis_systolic_array #(
 
             end
 
+            //=========================================================
+            // OUTPUT WORD 3
+            //=========================================================
+
             2'd3: begin
 
                 output_data[ACC_WIDTH-1:0] =
@@ -354,6 +480,10 @@ module axis_systolic_array #(
                             (3*ACC_WIDTH)];
 
             end
+
+            //=========================================================
+            // DEFAULT
+            //=========================================================
 
             default: begin
 
@@ -366,3 +496,5 @@ module axis_systolic_array #(
     end
 
 endmodule
+
+
